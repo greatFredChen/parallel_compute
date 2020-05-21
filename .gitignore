@@ -1,0 +1,12 @@
+test/
+vscode test/
+*.zip
+bin/
+obj/
+*.cbp
+*.layout
+*.depend
+*.exe
+*.o
+*.doc
+*.docx
