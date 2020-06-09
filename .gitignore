@@ -10,3 +10,12 @@ obj/
 *.o
 *.doc
 *.docx
+李赞-1712903-第6次作业/
+*.vcxproj
+*.vcxproj.*
+.vs/
+x64/
+*.sln
+*.txt
+Debug/
+Release/
