@@ -10,8 +10,8 @@
 #include<memory.h>
 #include<string>
 using namespace std;
-const int N = 10; // 矩阵规模
-const int dynamic_size = 2; // 动态划分粒度
+const int N = 2000; // 矩阵规模
+const int dynamic_size = 50; // 动态划分粒度
 float matrix[N][N + 1]; // 原始矩阵
 float copy_matrix[N][N + 1]; // 拷贝矩阵
 LARGE_INTEGER Freq, beginTime, endTime; // 用于计时
@@ -25,7 +25,8 @@ enum  parallel_way
 	serial,
 	pthread,
 	openmp,
-	mpi
+	mpi,
+	mpi_openmp
 };
 // 时间开始
 void time_start()
@@ -43,6 +44,7 @@ void time_end(parallel_way p)
 		case pthread: way_str = "pthread"; break;
 		case openmp: way_str = "openmp"; break;
 		case mpi: way_str = "MPI"; break;
+		case mpi_openmp: way_str = "MPI+openmp混合模式"; break;
 		default: way_str = "未知类型"; break;
 
 	}
@@ -295,13 +297,125 @@ void openmp_SSE(float(*matrix)[N + 1])
 	}
 	time_end(parallel_way::openmp);
 }
+// MPI + openmp 混合模式
+void mpi_openmp_SSE(float(*matrix)[N + 1])
+{
+	// 线程id
+	int myid;
+	MPI_Comm_rank(MPI_COMM_WORLD, &myid);
+	// 临时存储矩阵
+	float temp_matrix[dynamic_size * 2][N + 1];
+	// 状态
+	MPI_Status status;
+	if (process_thread_count == 1)
+	{
+		serial_Gaussian(matrix, parallel_way::mpi_openmp);
+		return;
+	}
+	if (myid == 0)
+	{
+		// 主线程计时
+		time_start();
+		// 主线程只负责分发任务
+		// 一共执行k次，每次都发送k的行号 第k行数据 k+1到N行的矩阵(每次发送dynamic_size行)
+		for (int k = 0; k < N; k++)
+		{
+			// k的行号 第k行数据每个线程都需要
+			#pragma omp parallel for num_threads(process_thread_count)
+			for (int thread_id = 1; thread_id < process_thread_count; thread_id++)
+			{
+				MPI_Send(&k, 1, MPI_INT, thread_id, N + 200, MPI_COMM_WORLD); // tag = N + 200表示发送行号k
+				MPI_Send(&matrix[k][0], N + 1, MPI_FLOAT, thread_id, N + 100, MPI_COMM_WORLD); // tag = N + 100 发送第k行数据
+			}
+			// 动态划分发送k + 1 到 N 行的矩阵  以当前行号作为tag，识别对应的行
+			// 初始发送阶段
+			int i, finished = 1; // 主线程默认完成
+			#pragma omp parallel for num_threads(process_thread_count)
+			for (i = 1; i < process_thread_count; i++)
+			{
+				if (k + 1 + (i - 1) * dynamic_size < N)
+				{
+					MPI_Send(&matrix[k + 1 + (i - 1) * dynamic_size][0], dynamic_size * (N + 1), MPI_FLOAT,
+						i, k + 1 + (i - 1) * dynamic_size, MPI_COMM_WORLD);
+				}
+				else // 若是越界，则直接结束接下来的进程
+				{
+					MPI_Send(&matrix[0][0], dynamic_size * (N + 1), MPI_FLOAT, i, N + 1, MPI_COMM_WORLD);
+					finished++;
+				}
+			}
+			i--; // 之前算了0-process_thread_count - 2对应的行标签，此时的i为process_thread_count，因此要自减1
+
+			// 接收阶段
+			while (finished < process_thread_count) // 是否所有的分支线程都已经完成
+			{
+				MPI_Recv(&temp_matrix[0][0], dynamic_size * (N + 1), MPI_FLOAT, MPI_ANY_SOURCE, MPI_ANY_TAG,
+					MPI_COMM_WORLD, &status);
+				// 拷贝到原来矩阵 注意memcpy拷贝是否越界！！！！！
+				if (status.MPI_TAG + dynamic_size <= N)
+					memcpy(&matrix[status.MPI_TAG][0], &temp_matrix[0][0], sizeof(float) * dynamic_size * (N + 1));
+				else
+					memcpy(&matrix[status.MPI_TAG][0], &temp_matrix[0][0], sizeof(float) *
+					(N - status.MPI_TAG) * (N + 1));
+				// 假如复制还没有完成，则继续进行
+				if (k + 1 + i * dynamic_size < N)
+				{
+					MPI_Send(&matrix[k + 1 + i * dynamic_size][0], dynamic_size * (N + 1), MPI_FLOAT, status.MPI_SOURCE, k + 1 + i * dynamic_size, MPI_COMM_WORLD);
+					i++;
+				}
+				else // 复制已经完成 结束分支线程的内层循环
+				{
+					MPI_Send(&matrix[0][0], dynamic_size * (N + 1), MPI_FLOAT, status.MPI_SOURCE, N + 1, MPI_COMM_WORLD);
+					finished++;
+				}
+			}
+		}
+		// k次循环结束后，结束分支线程的外层循环
+		int k = N + 1;
+		#pragma omp parallel for num_threads(process_thread_count)
+		for (int i = 1; i < process_thread_count; i++)
+			MPI_Send(&k, 1, MPI_INT, i, N + 200, MPI_COMM_WORLD);
+		time_end(parallel_way::mpi_openmp);
+	}
+	else
+	{
+		// 次线程负责运算执行任务
+		while (1)
+		{
+			int k; // 第k行行号
+			MPI_Recv(&k, 1, MPI_INT, 0, N + 200, MPI_COMM_WORLD, &status);
+			if (k >= N)
+				break;
+			// 接收第k行
+			MPI_Recv(&temp_matrix[0][0], N + 1, MPI_FLOAT, 0, N + 100, MPI_COMM_WORLD, &status);
+			// 内层循环接收原矩阵并进行运算
+			while (1)
+			{
+				// 接收第k + 1 到 k + 1 + dynamic_size行
+				MPI_Recv(&temp_matrix[1][0], dynamic_size * (N + 1), MPI_FLOAT, 0, MPI_ANY_TAG,
+					MPI_COMM_WORLD, &status);
+				if (status.MPI_TAG >= N)
+					break;
+				// 从1 到 dynamic_size
+				for (int i = 1; i <= dynamic_size; i++)
+				{
+					temp_matrix[i][k] /= temp_matrix[0][k];
+					column_SSE(temp_matrix, i, k, 0);
+					temp_matrix[i][k] = 0;
+				}
+				// 运算之后返回结果
+				MPI_Send(&temp_matrix[1][0], dynamic_size * (N + 1), MPI_FLOAT, 0, status.MPI_TAG, MPI_COMM_WORLD);
+			}
+		}
+	}
+}
 int main(int argc, char *argv[])
 {
 	// 初始化
-	int myid;
-
+	int myid, provided;
+	// 使用multiple等级的MPI调用
+	MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 	// mpi + SSE
-	MPI_Init(&argc, &argv);
 	MPI_Comm_rank(MPI_COMM_WORLD, &myid);
 	MPI_Comm_size(MPI_COMM_WORLD, &process_thread_count);
 	if (myid == 0)
@@ -310,7 +424,6 @@ int main(int argc, char *argv[])
 		copyMatrix(copy_matrix, matrix);
 	}
 	mpi_SSE(copy_matrix);
-	MPI_Finalize();
 
 	// 串行算法
 	if (myid == 0)
@@ -344,5 +457,14 @@ int main(int argc, char *argv[])
 		copyMatrix(copy_matrix, matrix);
 		openmp_SSE(copy_matrix);
 	}
+
+	// 开启多线程集群模式 混合编程模式版本 
+	// MPI + openmp	
+	if (myid == 0)
+		copyMatrix(copy_matrix, matrix);
+	if (provided < MPI_THREAD_MULTIPLE)
+		MPI_Abort(MPI_COMM_WORLD, 1);
+	mpi_openmp_SSE(copy_matrix);
+	MPI_Finalize();
 	return 0;
 }
