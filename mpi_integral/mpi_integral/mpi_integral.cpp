@@ -48,7 +48,6 @@ void mpi_integral(int a, int b, int n)
 	double *local_b_array = new double[Process_Count];
 	double *mysum_array = new double[Process_Count];
 	double local_a, local_b, my_sum;
-	MPI_Status status;
 	// 计时
 	start_time();
 	// scatter分发数据
@@ -74,6 +73,9 @@ void mpi_integral(int a, int b, int n)
 		end_time(way::mpi);
 		printf("(mpi)The result of integral is: %f\n", total_sum * h);
 	}
+	delete local_a_array;
+	delete local_b_array;
+	delete mysum_array;
 }
 void omp_integral(int a, int b, int n)
 {
@@ -115,7 +117,7 @@ void serial_integral(int a, int b, int n)
 int main(int argc, char *argv[])
 {
 	int myid, provided; // 进程号
-	int a = 0, b = 1, n = 30;
+	int a = 0, b = 1, n = 10000;
 
 	// MPI
 	MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
